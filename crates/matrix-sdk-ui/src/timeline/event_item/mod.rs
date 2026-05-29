@@ -943,6 +943,10 @@ mod tests {
                 msgtype: MessageType::Text(TextMessageEventContent::plain("hello")),
                 edited: false,
                 mentions: None,
+                #[cfg(feature = "experimental-event-streams")]
+                stream: None,
+                #[cfg(feature = "experimental-event-streams")]
+                transient_body: None,
             }),
             reactions: Default::default(),
             thread_root: None,

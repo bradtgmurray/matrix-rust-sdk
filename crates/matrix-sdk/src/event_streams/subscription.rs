@@ -1,8 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use js_int::UInt;
 use ruma::{
-    OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, assign,
+    MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, assign,
     events::{
         ToDeviceEvent,
         event_stream::{
@@ -13,6 +13,7 @@ use ruma::{
     },
 };
 use tokio::sync::{Mutex, broadcast};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 use super::{EventStreamError, Result, StreamId, send_to_device};
@@ -39,8 +40,7 @@ pub enum EventStreamSubscriberUpdate {
         body: String,
     },
 
-    /// The publisher rejected the subscription or ended the stream for this
-    /// subscriber.
+    /// The publisher rejected the subscription or ended the stream for this subscriber.
     Cancelled {
         /// The stream that became terminal.
         stream_id: StreamId,
@@ -48,6 +48,12 @@ pub enum EventStreamSubscriberUpdate {
         code: StreamCancelCode,
         /// Optional human-readable context from the publisher.
         reason: Option<String>,
+    },
+
+    /// The advertised stream lifetime elapsed on this subscriber.
+    Expired {
+        /// The stream that expired.
+        stream_id: StreamId,
     },
 }
 
@@ -60,6 +66,8 @@ struct SubscriberState {
     current_body: Option<String>,
     append_valid: bool,
     resync_pending: bool,
+    expires_at_ms: Option<u64>,
+    expiry_token: Option<CancellationToken>,
 }
 
 #[derive(Debug)]
@@ -136,6 +144,7 @@ impl EventStreamSubscriptions {
         publisher_user_id: OwnedUserId,
         descriptor: StreamDescriptor,
         descriptor_body: String,
+        descriptor_origin_server_ts: MilliSecondsSinceUnixEpoch,
     ) -> Result<EventStreamSubscription> {
         let own_device_id = self
             .inner
@@ -145,6 +154,10 @@ impl EventStreamSubscriptions {
             .to_owned();
 
         let stream_id = StreamId::new(room_id.clone(), event_id.clone());
+        let expires_at_ms = descriptor.expiry_ms.map(|expiry_ms| {
+            u64::from(descriptor_origin_server_ts.0).saturating_add(u64::from(expiry_ms))
+        });
+        let expiry_token = expires_at_ms.map(|_| CancellationToken::new());
 
         // Create our local state for managing the subscription. A duplicate
         // subscription without a resync request should not cause us to lose
@@ -157,6 +170,8 @@ impl EventStreamSubscriptions {
             current_body: Some(descriptor_body),
             append_valid: true,
             resync_pending: false,
+            expires_at_ms,
+            expiry_token: expiry_token.clone(),
         };
         self.inner
             .subscriptions
@@ -164,11 +179,34 @@ impl EventStreamSubscriptions {
             .await
             .entry(stream_id.clone())
             .and_modify(|state| {
+                if let Some(token) = state.expiry_token.take() {
+                    token.cancel();
+                }
                 state.publisher_user_id = publisher_user_id.clone();
                 state.publisher_device_id = descriptor.device_id.clone();
                 state.subscriber_device_id = own_device_id.clone();
+                state.expires_at_ms = expires_at_ms;
+                state.expiry_token = expiry_token.clone();
             })
             .or_insert(state);
+
+        if let (Some(expires_at_ms), Some(expiry_token)) = (expires_at_ms, expiry_token) {
+            let subscriptions = self.clone();
+            let expiring_stream_id = stream_id.clone();
+            self.inner.client.task_monitor().spawn_finite_task(
+                "event_streams::subscription_expiry",
+                async move {
+                    let now_ms = u64::from(MilliSecondsSinceUnixEpoch::now().0);
+                    let delay = Duration::from_millis(expires_at_ms.saturating_sub(now_ms));
+                    tokio::select! {
+                        _ = expiry_token.cancelled() => {}
+                        _ = tokio::time::sleep(delay) => {
+                            subscriptions.expire(&expiring_stream_id, expires_at_ms).await;
+                        }
+                    }
+                },
+            );
+        }
 
         // Send the to-device event to let the publisher know we'd like updates
         let content = StreamSubscribeEventContent::new(room_id, event_id, own_device_id);
@@ -225,6 +263,9 @@ impl EventStreamSubscriptions {
         let Some(state) = self.inner.subscriptions.lock().await.remove(stream_id) else {
             return;
         };
+        if let Some(token) = state.expiry_token.as_ref() {
+            token.cancel();
+        }
 
         let content = StreamCancelEventContent::new(
             stream_id.room_id.clone(),
@@ -251,6 +292,33 @@ impl EventStreamSubscriptions {
                 "unsubscribed from event stream"
             );
         }
+    }
+
+    async fn expire(&self, stream_id: &StreamId, expires_at_ms: u64) {
+        let expired = {
+            let mut subscriptions = self.inner.subscriptions.lock().await;
+            if subscriptions.get(stream_id).and_then(|state| state.expires_at_ms)
+                != Some(expires_at_ms)
+            {
+                return;
+            }
+
+            subscriptions.remove(stream_id).is_some()
+        };
+
+        if !expired {
+            return;
+        }
+
+        trace!(
+            room_id = %stream_id.room_id,
+            event_id = %stream_id.event_id,
+            "event stream subscription expired locally"
+        );
+        let _ = self
+            .inner
+            .updates_sender
+            .send(EventStreamSubscriberUpdate::Expired { stream_id: stream_id.clone() });
     }
 
     async fn handle_update(&self, event: ToDeviceEvent<StreamUpdateEventContent>) {
@@ -416,7 +484,11 @@ impl EventStreamSubscriptions {
                 return;
             }
 
-            subscriptions.remove(&stream_id);
+            if let Some(state) = subscriptions.remove(&stream_id)
+                && let Some(token) = state.expiry_token
+            {
+                token.cancel();
+            }
             trace!(
                 room_id = %stream_id.room_id,
                 event_id = %stream_id.event_id,
@@ -437,6 +509,8 @@ impl EventStreamSubscriptions {
                     room_id = %stream_id.room_id,
                     event_id = %stream_id.event_id,
                     sender = %sender,
+                    ?content.code,
+                    reason = ?content.reason.as_deref(),
                     "ignored cancellation for untracked event stream"
                 );
                 return;
@@ -455,13 +529,18 @@ impl EventStreamSubscriptions {
                 return;
             }
 
-            subscriptions.remove(&stream_id);
+            if let Some(state) = subscriptions.remove(&stream_id)
+                && let Some(token) = state.expiry_token
+            {
+                token.cancel();
+            }
         }
 
         trace!(
             room_id = %stream_id.room_id,
             event_id = %stream_id.event_id,
             ?content.code,
+            reason = ?content.reason.as_deref(),
             "event stream subscription cancelled"
         );
         let _ = self.inner.updates_sender.send(EventStreamSubscriberUpdate::Cancelled {
@@ -574,6 +653,8 @@ mod tests {
                     current_body: Some("initial".to_owned()),
                     append_valid: true,
                     resync_pending: false,
+                    expires_at_ms: None,
+                    expiry_token: None,
                 },
             );
         }
@@ -650,6 +731,7 @@ mod tests {
                     self.publisher_user_id.clone(),
                     self.descriptor(),
                     "initial".to_owned(),
+                    MilliSecondsSinceUnixEpoch::now(),
                 )
                 .await
         }
@@ -863,6 +945,52 @@ mod tests {
         let _no_cancel =
             fixture.server().mock_send_to_device().ok().never().mount_as_scoped().await;
         fixture.subscriptions.unsubscribe(&fixture.stream_id).await;
+    }
+
+    #[async_test]
+    async fn test_subscription_expiry_removes_transient_body_and_notifies_observers() {
+        let fixture = SubscribableEventFixture::with_mock_server().await;
+        let mut updates = fixture.subscriptions.subscribe_to_updates();
+        let mut descriptor = fixture.descriptor();
+        descriptor.expiry_ms = Some(uint!(0));
+
+        let _subscribe = fixture
+            .server()
+            .mock_send_to_device()
+            .for_type(<StreamSubscribeEventContent as StaticEventContent>::TYPE)
+            .ok()
+            .mock_once()
+            .mount_as_scoped()
+            .await;
+        let _no_cancel = fixture
+            .server()
+            .mock_send_to_device()
+            .for_type(<StreamCancelEventContent as StaticEventContent>::TYPE)
+            .ok()
+            .never()
+            .mount_as_scoped()
+            .await;
+
+        fixture
+            .subscriptions
+            .subscribe(
+                fixture.stream_id.room_id.clone(),
+                fixture.stream_id.event_id.clone(),
+                fixture.publisher_user_id.clone(),
+                descriptor,
+                "initial".to_owned(),
+                MilliSecondsSinceUnixEpoch::now(),
+            )
+            .await
+            .unwrap();
+
+        match tokio::time::timeout(Duration::from_secs(1), updates.recv()).await.unwrap().unwrap() {
+            EventStreamSubscriberUpdate::Expired { stream_id } => {
+                assert_eq!(stream_id, fixture.stream_id);
+            }
+            update => panic!("expected expiry update, got {update:?}"),
+        }
+        assert!(fixture.subscriptions.transient_body(&fixture.stream_id).await.is_none());
     }
 
     #[async_test]

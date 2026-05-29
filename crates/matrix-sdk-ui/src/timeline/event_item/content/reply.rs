@@ -159,6 +159,8 @@ impl EmbeddedEvent {
                         Some(TimelineItemContent::message(
                             msg.msgtype,
                             msg.mentions,
+                            #[cfg(feature = "experimental-event-streams")]
+                            None,
                             reactions,
                             thread_root,
                             in_reply_to,

@@ -324,6 +324,8 @@ mod tests {
                 TimelineItemContent::message(
                     content.msgtype,
                     content.mentions,
+                    #[cfg(feature = "experimental-event-streams")]
+                    content.stream,
                     ReactionsByKeyBySender::default(),
                     None,
                     None,

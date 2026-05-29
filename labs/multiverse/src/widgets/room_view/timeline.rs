@@ -14,6 +14,8 @@ use ratatui::{prelude::*, widgets::*};
 
 use crate::{ALT_ROW_COLOR, NORMAL_ROW_COLOR, SELECTED_STYLE_FG, TEXT_COLOR};
 
+const HIGHLIGHT_SYMBOL_WIDTH: u16 = 1;
+
 pub struct TimelineView<'a> {
     items: &'a Vector<Arc<TimelineItem>>,
     is_thread: bool,
@@ -64,9 +66,12 @@ impl StatefulWidget for &mut TimelineView<'_> {
         Self: Sized,
     {
         timeline_list_state.list_index_to_item_index.clear();
+        let content_width = usize::from(area.width.saturating_sub(HIGHLIGHT_SYMBOL_WIDTH).max(1));
+        let max_item_height = usize::from(area.height.max(1));
 
         let content = self.items.iter().enumerate().filter_map(|(i, item)| {
-            let result = format_timeline_item(item, self.is_thread)?;
+            let result =
+                format_timeline_item(item, self.is_thread, content_width, max_item_height)?;
             timeline_list_state.list_index_to_item_index.push(i);
             Some(result)
         });
@@ -92,7 +97,12 @@ impl StatefulWidget for &mut TimelineView<'_> {
     }
 }
 
-fn format_timeline_item(item: &Arc<TimelineItem>, is_thread: bool) -> Option<ListItem<'_>> {
+fn format_timeline_item(
+    item: &Arc<TimelineItem>,
+    is_thread: bool,
+    content_width: usize,
+    max_item_height: usize,
+) -> Option<ListItem<'_>> {
     let item = match item.kind() {
         TimelineItemKind::Event(ev) => {
             let profile_name = match ev.sender_profile() {
@@ -108,7 +118,14 @@ fn format_timeline_item(item: &Arc<TimelineItem>, is_thread: bool) -> Option<Lis
                 }) => {
                     let thread_summary =
                         if is_thread { None } else { ev.content().thread_summary() };
-                    format_text_message(sender, message, thread_summary, ev.read_receipts())?
+                    format_text_message(
+                        sender,
+                        message,
+                        thread_summary,
+                        ev.read_receipts(),
+                        content_width,
+                        max_item_height,
+                    )?
                 }
 
                 TimelineItemContent::MsgLike(MsgLikeContent {
@@ -175,18 +192,19 @@ fn format_text_message(
     message: &Message,
     thread_summary: Option<ThreadSummary>,
     read_receipts: &IndexMap<OwnedUserId, Receipt>,
+    content_width: usize,
+    max_item_height: usize,
 ) -> Option<ListItem<'static>> {
     if let MessageType::Text(text) = message.msgtype() {
         let mut lines = Vec::new();
-        let first_line = Line::from(format!("{}: {}", sender, text.body));
+        let body = message.transient_body().unwrap_or(&text.body);
 
-        lines.push(first_line);
+        extend_wrapped_lines(&mut lines, format!("{sender}: {body}"), content_width);
 
         if let Some(thread_summary) = thread_summary {
             match thread_summary.latest_event {
                 TimelineDetails::Unavailable | TimelineDetails::Pending => {
-                    let thread_line = Line::from("  💬 ...");
-                    lines.push(thread_line);
+                    extend_wrapped_lines(&mut lines, "  💬 ...".to_owned(), content_width);
                 }
                 TimelineDetails::Ready(e) => {
                     let profile_name = match e.sender_profile {
@@ -202,10 +220,11 @@ fn format_text_message(
                         } else {
                             format!("{} replies", { thread_summary.num_replies })
                         };
-                        let thread_line =
-                            Line::from(format!("  💬 {replies} {sender}: {}", text.body));
-
-                        lines.push(thread_line);
+                        extend_wrapped_lines(
+                            &mut lines,
+                            format!("  💬 {replies} {sender}: {}", text.body),
+                            content_width,
+                        );
                     }
                 }
                 TimelineDetails::Error(_) => {}
@@ -228,12 +247,33 @@ fn format_text_message(
                     read_by = format!("{read_by} and {others_count} others");
                 }
             }
-            lines.push(Line::from(format!("  👀 read by {read_by}")));
+            extend_wrapped_lines(&mut lines, format!("  👀 read by {read_by}"), content_width);
         }
 
+        truncate_to_viewport(&mut lines, max_item_height);
         Some(ListItem::from(lines))
     } else {
         None
+    }
+}
+
+fn extend_wrapped_lines(lines: &mut Vec<Line<'static>>, content: String, width: usize) {
+    lines.extend(
+        textwrap::wrap(&content, textwrap::Options::new(width.max(1)))
+            .into_iter()
+            .map(|line| Line::from(line.into_owned())),
+    );
+}
+
+fn truncate_to_viewport(lines: &mut Vec<Line<'static>>, max_item_height: usize) {
+    if lines.len() <= max_item_height {
+        return;
+    }
+
+    // Ratatui's List does not display a list item taller than its viewport.
+    lines.truncate(max_item_height);
+    if max_item_height > 1 {
+        *lines.last_mut().expect("max item height is non-zero") = Line::from("...");
     }
 }
 

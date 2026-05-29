@@ -17,8 +17,12 @@ use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use imbl::vector;
+#[cfg(feature = "experimental-event-streams")]
+use matrix_sdk::deserialized_responses::TimelineEvent;
 use matrix_sdk::{assert_next_with_timeout, test_utils::mocks::MatrixMockServer};
 use matrix_sdk_base::ThreadingSupport;
+#[cfg(feature = "experimental-event-streams")]
+use matrix_sdk_test::sync_timeline_event;
 use matrix_sdk_test::{
     ALICE, BOB, CAROL, JoinedRoomBuilder, async_test,
     event_factory::{EventFactory, PreviousMembership},
@@ -75,6 +79,44 @@ async fn test_initial_events() {
 
     let item = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     assert_matches!(&item.kind, TimelineItemKind::Virtual(VirtualTimelineItem::DateDivider(_)));
+}
+
+#[cfg(feature = "experimental-event-streams")]
+#[async_test]
+async fn test_event_stream_transient_body() {
+    let timeline = TestTimeline::new();
+    let event_id = event_id!("$stream_event");
+
+    timeline
+        .handle_live_event(TimelineEvent::from_plaintext(sync_timeline_event!({
+            "content": {
+                "body": "",
+                "msgtype": "m.text",
+                "org.matrix.msc4471.stream": {
+                    "device_id": "STREAM_DEVICE",
+                    "expiry_ms": 300000
+                }
+            },
+            "event_id": event_id,
+            "origin_server_ts": 10,
+            "sender": "@alice:example.org",
+            "type": "m.room.message"
+        })))
+        .await;
+
+    let items = timeline.controller.items().await;
+    let message = items.iter().find_map(|item| item.as_event()?.content().as_message()).unwrap();
+    assert!(message.stream().is_some());
+    assert_eq!(message.transient_body(), None);
+
+    timeline
+        .controller
+        .set_event_stream_transient_body(event_id, Some("partial answer".to_owned()))
+        .await;
+
+    let items = timeline.controller.items().await;
+    let message = items.iter().find_map(|item| item.as_event()?.content().as_message()).unwrap();
+    assert_eq!(message.transient_body(), Some("partial answer"));
 }
 
 #[async_test]

@@ -71,6 +71,8 @@ mod error;
 pub mod event_filter;
 mod event_handler;
 mod event_item;
+#[cfg(feature = "experimental-event-streams")]
+mod event_streams;
 pub mod futures;
 mod item;
 mod latest_event;
@@ -83,6 +85,8 @@ pub mod thread_list_service;
 mod traits;
 mod virtual_item;
 
+#[cfg(feature = "experimental-event-streams")]
+pub use self::event_streams::EventStreamSubscription;
 pub use self::{
     builder::TimelineBuilder,
     controller::default_event_filter,
@@ -227,6 +231,17 @@ impl Timeline {
     /// Returns the room for this timeline.
     pub fn room(&self) -> &Room {
         self.controller.room()
+    }
+
+    /// Subscribe to live event streams advertised by messages visible in this
+    /// timeline.
+    ///
+    /// The returned handle updates [`Message::transient_body`] while active.
+    /// Call [`EventStreamSubscription::unsubscribe`] when this timeline is no
+    /// longer focused to cancel the active SDK subscriptions.
+    #[cfg(feature = "experimental-event-streams")]
+    pub async fn subscribe_to_event_streams(&self) -> EventStreamSubscription {
+        EventStreamSubscription::new(self).await
     }
 
     /// Clear all timeline items.

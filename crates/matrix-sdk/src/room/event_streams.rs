@@ -51,6 +51,8 @@ impl Room {
     ) -> Result<EventStreamSubscription> {
         let event = self.load_or_fetch_event(event_id, None).await?;
         let publisher_user_id = event.sender().ok_or(EventStreamError::MissingDescriptorSender)?;
+        let descriptor_origin_server_ts =
+            event.timestamp().ok_or(EventStreamError::InvalidDescriptorEvent)?;
         let (descriptor, descriptor_body) = stream_descriptor_and_body(&event)?;
 
         self.client()
@@ -62,6 +64,7 @@ impl Room {
                 publisher_user_id,
                 descriptor,
                 descriptor_body,
+                descriptor_origin_server_ts,
             )
             .await
     }

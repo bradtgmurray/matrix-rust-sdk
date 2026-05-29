@@ -460,6 +460,34 @@ impl<P: RoomDataProvider> TimelineController<P> {
         self.state.read().await.items.clone_items()
     }
 
+    #[cfg(feature = "experimental-event-streams")]
+    pub(super) async fn set_event_stream_transient_body(
+        &self,
+        event_id: &EventId,
+        transient_body: Option<String>,
+    ) {
+        let mut state = self.state.write().await;
+        let Some((index, item)) = rfind_event_by_id(&state.items, event_id) else {
+            return;
+        };
+
+        let mut event_item = item.inner.clone();
+        let Some(message) = event_item.content_mut().as_message_mut() else {
+            return;
+        };
+
+        if transient_body.is_some() && message.stream().is_none() {
+            return;
+        }
+        if message.transient_body() == transient_body.as_deref() {
+            return;
+        }
+
+        message.set_transient_body(transient_body);
+        let item = TimelineItem::new(event_item, item.internal_id.to_owned());
+        state.items.replace(index, item);
+    }
+
     #[cfg(test)]
     pub(super) async fn subscribe_raw(
         &self,
@@ -949,6 +977,8 @@ impl<P: RoomDataProvider> TimelineController<P> {
             prev_item.with_kind(ti_kind).with_content(TimelineItemContent::message(
                 content.msgtype,
                 content.mentions,
+                #[cfg(feature = "experimental-event-streams")]
+                content.stream,
                 prev_item.content().reactions().cloned().unwrap_or_default(),
                 prev_item.content().thread_root(),
                 prev_item.content().in_reply_to(),

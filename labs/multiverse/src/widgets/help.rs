@@ -64,6 +64,7 @@ impl Widget for &mut HelpView {
                 Cell::from("Ctrl-t"),
                 Cell::from("Open a thread on the focused timeline item"),
             ]),
+            Row::new(vec![Cell::from("/mention"), Cell::from("Mention a user in a message")]),
             Row::new(vec![Cell::from("Ctrl-r"), Cell::from("Create a new room")]),
             Row::new(vec![Cell::from("Ctrl-s"), Cell::from("Search")]),
         ];

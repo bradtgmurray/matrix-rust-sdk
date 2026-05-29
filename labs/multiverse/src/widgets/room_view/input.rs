@@ -14,7 +14,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Invite { user_id: String },
+    Invite {
+        user_id: String,
+    },
+    Mention {
+        user_id: String,
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        message: Vec<String>,
+    },
     Leave,
     Subscribe,
     Unsubscribe,

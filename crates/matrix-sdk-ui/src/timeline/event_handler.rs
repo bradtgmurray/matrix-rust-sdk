@@ -457,6 +457,8 @@ impl TimelineAction {
                 content: TimelineItemContent::message(
                     msg.msgtype,
                     msg.mentions,
+                    #[cfg(feature = "experimental-event-streams")]
+                    msg.stream,
                     Default::default(),
                     thread_root,
                     in_reply_to,

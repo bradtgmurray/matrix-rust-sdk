@@ -232,6 +232,14 @@ impl TimelineItemContent {
         }) => message)
     }
 
+    #[cfg(feature = "experimental-event-streams")]
+    pub(in crate::timeline) fn as_message_mut(&mut self) -> Option<&mut Message> {
+        as_variant!(self, Self::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::Message(message),
+            ..
+        }) => message)
+    }
+
     /// Check whether this item's content is a
     /// [`Message`][MsgLikeKind::Message].
     pub fn is_message(&self) -> bool {
@@ -296,6 +304,9 @@ impl TimelineItemContent {
     pub(crate) fn message(
         msgtype: MessageType,
         mentions: Option<Mentions>,
+        #[cfg(feature = "experimental-event-streams")] stream: Option<
+            ruma::events::event_stream::StreamDescriptor,
+        >,
         reactions: ReactionsByKeyBySender,
         thread_root: Option<OwnedEventId>,
         in_reply_to: Option<InReplyToDetails>,
@@ -308,6 +319,8 @@ impl TimelineItemContent {
             kind: MsgLikeKind::Message(Message::from_event(
                 msgtype,
                 mentions,
+                #[cfg(feature = "experimental-event-streams")]
+                stream,
                 None,
                 remove_reply_fallback,
             )),

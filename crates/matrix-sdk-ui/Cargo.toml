@@ -21,6 +21,9 @@ unstable-msc3956 = ["ruma/unstable-msc3956"]
 # Add support for inline media galleries via msgtypes
 unstable-msc4274 = ["matrix-sdk/unstable-msc4274"]
 
+# Enable experimental support for MSC4471 event streams.
+experimental-event-streams = ["matrix-sdk/experimental-event-streams", "ruma/unstable-msc4471"]
+
 # Enable experimental support for encrypting state events; see
 # https://github.com/matrix-org/matrix-rust-sdk/issues/5397.
 experimental-encrypted-state-events = [

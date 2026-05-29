@@ -11,12 +11,15 @@ use matrix_sdk::{
     ruma::{
         OwnedEventId, OwnedRoomId, RoomId, UserId,
         api::client::receipt::create_receipt::v3::ReceiptType,
-        events::room::message::RoomMessageEventContent,
+        events::{Mentions, room::message::RoomMessageEventContent},
     },
 };
 use matrix_sdk_ui::{
     Timeline,
-    timeline::{TimelineBuilder, TimelineFocus, TimelineItem, TimelineReadReceiptTracking},
+    timeline::{
+        EventStreamSubscription, TimelineBuilder, TimelineFocus, TimelineItem,
+        TimelineReadReceiptTracking,
+    },
 };
 use ratatui::{prelude::*, widgets::*};
 use tokio::{spawn, sync::OnceCell, task::JoinHandle};
@@ -81,6 +84,8 @@ pub struct RoomView {
     timeline_list: TimelineListState,
 
     input: Input,
+
+    event_stream_subscription: Option<EventStreamSubscription>,
 }
 
 impl RoomView {
@@ -94,6 +99,7 @@ impl RoomView {
             kind: TimelineKind::Room { room: None },
             input: Input::new(),
             timeline_list: TimelineListState::default(),
+            event_stream_subscription: None,
         }
     }
 
@@ -342,7 +348,13 @@ impl RoomView {
         }
     }
 
-    pub fn set_selected_room(&mut self, room_id: Option<OwnedRoomId>) {
+    pub async fn set_selected_room(&mut self, room_id: Option<OwnedRoomId>) {
+        if self.room_id() == room_id.as_deref() {
+            return;
+        }
+
+        self.unsubscribe_from_event_streams().await;
+
         if let Some(room_id) = room_id.as_deref() {
             let maybe_room = self.client.get_room(room_id);
 
@@ -361,9 +373,37 @@ impl RoomView {
                     }
                 }
             }
+        } else {
+            self.kind = TimelineKind::Room { room: None };
         }
 
+        self.ensure_event_stream_subscription().await;
+
         self.timeline_list = TimelineListState::default();
+    }
+
+    pub async fn ensure_event_stream_subscription(&mut self) {
+        if self.event_stream_subscription.is_some()
+            || matches!(&self.mode, Mode::Normal { invited_room_view: Some(_) })
+        {
+            return;
+        }
+
+        let Some(room_id) = self.room_id().map(ToOwned::to_owned) else {
+            return;
+        };
+        let Some(timeline) = self.get_selected_timeline() else {
+            return;
+        };
+
+        info!(%room_id, "starting event stream subscriptions for selected timeline");
+        self.event_stream_subscription = Some(timeline.subscribe_to_event_streams().await);
+    }
+
+    pub async fn unsubscribe_from_event_streams(&mut self) {
+        if let Some(subscription) = self.event_stream_subscription.take() {
+            subscription.unsubscribe().await;
+        }
     }
 
     fn get_selected_timeline(&self) -> Option<Arc<Timeline>> {
@@ -550,6 +590,9 @@ impl RoomView {
     async fn handle_command(&mut self, command: input::Command) {
         match command {
             input::Command::Invite { user_id } => self.invite_member(&user_id).await,
+            input::Command::Mention { user_id, message } => {
+                self.send_mention(&user_id, message.join(" ")).await
+            }
             input::Command::Leave => self.leave_room().await,
             input::Command::Subscribe => self.subscribe_thread().await,
             input::Command::Unsubscribe => self.unsubscribe_thread().await,
@@ -557,8 +600,35 @@ impl RoomView {
     }
 
     async fn send_message(&mut self, message: String) {
+        self.send_message_content(RoomMessageEventContent::text_plain(message)).await;
+    }
+
+    async fn send_mention(&mut self, user_id: &str, message: String) {
+        let Some(room) = self.room() else {
+            self.status_handle.set_message("missing room".to_owned());
+            return;
+        };
+
+        let user_id = match UserId::parse_with_server_name(
+            user_id,
+            room.client().user_id().unwrap().server_name(),
+        ) {
+            Ok(user_id) => user_id,
+            Err(error) => {
+                self.status_handle
+                    .set_message(format!("Failed to parse {user_id} as a user ID: {error:?}"));
+                return;
+            }
+        };
+
+        let content = RoomMessageEventContent::text_plain(format!("{user_id}: {message}"))
+            .add_mentions(Mentions::with_user_ids([user_id]));
+        self.send_message_content(content).await;
+    }
+
+    async fn send_message_content(&mut self, content: RoomMessageEventContent) {
         if let Some(sdk_timeline) = self.get_selected_timeline() {
-            match sdk_timeline.send(RoomMessageEventContent::text_plain(message).into()).await {
+            match sdk_timeline.send(content.into()).await {
                 Ok(_) => {
                     self.input.clear();
                 }

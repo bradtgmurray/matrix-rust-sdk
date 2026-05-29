@@ -586,7 +586,7 @@ impl App {
             }) => {
                 self.room_list.next_room().await;
                 let room_id = self.room_list.get_selected_room_id();
-                self.room_view.set_selected_room(room_id);
+                self.room_view.set_selected_room(room_id).await;
             }
 
             Event::Key(KeyEvent {
@@ -594,7 +594,7 @@ impl App {
             }) => {
                 self.room_list.previous_room().await;
                 let room_id = self.room_list.get_selected_room_id();
-                self.room_view.set_selected_room(room_id);
+                self.room_view.set_selected_room(room_id).await;
             }
 
             Event::Key(KeyEvent { code: Char('m'), modifiers: KeyModifiers::ALT, .. }) => {
@@ -669,6 +669,7 @@ impl App {
                 }
             }
 
+            self.room_view.ensure_event_stream_subscription().await;
             terminal.draw(|f| f.render_widget(&mut *self, f.area()))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -677,6 +678,7 @@ impl App {
                 match &mut self.state.global_mode {
                     GlobalMode::Default => {
                         if self.handle_global_event(event).await? {
+                            self.room_view.unsubscribe_from_event_streams().await;
                             let sync_service = self.sync_service.clone();
                             let timelines = self.timelines.clone();
                             let listen_task = self.listen_task.abort_handle();

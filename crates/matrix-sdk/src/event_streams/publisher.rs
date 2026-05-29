@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    iter,
     sync::{Arc, Weak},
 };
 
@@ -511,14 +512,28 @@ impl EventStreamPublishers {
         content: &StreamSubscribeEventContent,
         sender: &UserId,
     ) -> SubscriptionValidationResult<(PublisherHandle, bool)> {
-        self.validate_subscriber_device(content, sender).await?;
+        Self::validate_subscriber_device_id(content)?;
         let publisher = self.publisher(stream_id).await.map_err(|_| {
             (StreamCancelCode::UnknownStream, "Unknown or expired stream".to_owned())
         })?;
         self.validate_stream_visibility(&publisher, stream_id, sender).await?;
+        self.validate_subscriber_device(content, sender).await?;
 
         let should_notify = publisher.register_subscription(content, sender).await?;
         Ok((publisher, should_notify))
+    }
+
+    fn validate_subscriber_device_id(
+        content: &StreamSubscribeEventContent,
+    ) -> SubscriptionValidationResult<()> {
+        if content.subscriber_device_id.as_str().is_empty() {
+            return Err((
+                StreamCancelCode::InvalidSubscription,
+                "Empty subscriber device ID".to_owned(),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Check that updates would be sent to a device owned by the subscribing
@@ -528,10 +543,43 @@ impl EventStreamPublishers {
         content: &StreamSubscribeEventContent,
         sender: &UserId,
     ) -> SubscriptionValidationResult<()> {
-        if content.subscriber_device_id.as_str().is_empty() {
+        match self.inner.client.encryption().get_device(sender, &content.subscriber_device_id).await
+        {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) => {
+                warn!("failed to look up event stream subscriber device: {error}");
+                return Err((
+                    StreamCancelCode::InvalidSubscription,
+                    "Subscriber device could not be validated".to_owned(),
+                ));
+            }
+        }
+
+        trace!(
+            subscriber_user_id = %sender,
+            subscriber_device_id = %content.subscriber_device_id,
+            "querying device keys for uncached event stream subscriber"
+        );
+        let (request_id, device_keys) = {
+            let olm = self.inner.client.olm_machine().await;
+            let Some(olm) = olm.as_ref() else {
+                return Err((
+                    StreamCancelCode::InvalidSubscription,
+                    "Subscriber device could not be validated".to_owned(),
+                ));
+            };
+            let (request_id, request) = olm.query_keys_for_users(iter::once(sender));
+            (request_id, request.device_keys)
+        };
+
+        if !device_keys.is_empty()
+            && let Err(error) = self.inner.client.keys_query(&request_id, device_keys).await
+        {
+            warn!("failed to query event stream subscriber device keys: {error}");
             return Err((
                 StreamCancelCode::InvalidSubscription,
-                "Empty subscriber device ID".to_owned(),
+                "Subscriber device could not be validated".to_owned(),
             ));
         }
 
@@ -543,7 +591,7 @@ impl EventStreamPublishers {
                 "Subscriber device does not belong to the subscribing user".to_owned(),
             )),
             Err(error) => {
-                warn!("failed to look up event stream subscriber device: {error}");
+                warn!("failed to look up event stream subscriber device after key query: {error}");
                 Err((
                     StreamCancelCode::InvalidSubscription,
                     "Subscriber device could not be validated".to_owned(),
@@ -780,6 +828,53 @@ mod tests {
 
     async fn set_up_subscribable_stream() -> SubscribableStreamFixture {
         set_up_subscribable_stream_with_options(EventStreamPublisherOptions::default()).await
+    }
+
+    async fn set_up_subscribable_stream_with_uncached_subscriber() -> SubscribableStreamFixture {
+        let server = MatrixMockServer::new().await;
+        server.mock_crypto_endpoints_preset().await;
+        let publisher_user_id = owned_user_id!("@publisher:example.org");
+        let publisher_device_id = owned_device_id!("PUBLISHER");
+        let subscriber_user_id = owned_user_id!("@subscriber:example.org");
+        let subscriber_device_id = owned_device_id!("SUBSCRIBER");
+        let client = server
+            .client_builder_for_crypto_end_to_end(&publisher_user_id, &publisher_device_id)
+            .build()
+            .await;
+        let subscriber_client = server
+            .client_builder_for_crypto_end_to_end(&subscriber_user_id, &subscriber_device_id)
+            .build()
+            .await;
+        server.mock_sync().ok_and_run(&subscriber_client, |_| {}).await;
+
+        let room_id = room_id!("!stream:example.org");
+        let room = server.sync_joined_room(&client, room_id).await;
+        server.mock_room_state_encryption().expect_any_access_token().plain().mount().await;
+        server
+            .mock_room_send()
+            .expect_any_access_token()
+            .body_matches_partial_json(json!({ "body": "initial" }))
+            .ok(event_id!("$descriptor"))
+            .mock_once()
+            .mount()
+            .await;
+        let publisher = room
+            .send_streaming_message(
+                RoomMessageEventContent::text_plain("initial"),
+                EventStreamPublisherOptions::default(),
+            )
+            .await
+            .unwrap();
+        let stream_id = publisher.stream_id().clone();
+
+        SubscribableStreamFixture {
+            server,
+            publisher,
+            stream_id,
+            publisher_user_id,
+            subscriber_user_id,
+            subscriber_device_id,
+        }
     }
 
     async fn set_up_subscribable_stream_with_options(
@@ -1111,6 +1206,103 @@ mod tests {
     }
 
     #[async_test]
+    async fn test_accepts_valid_uncached_subscriber_device_after_key_query() {
+        let fixture = set_up_subscribable_stream_with_uncached_subscriber().await;
+        assert!(
+            fixture
+                .publisher
+                .publishers
+                .inner
+                .client
+                .encryption()
+                .get_device(&fixture.subscriber_user_id, &fixture.subscriber_device_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let f = EventFactory::new()
+            .room(&fixture.stream_id.room_id)
+            .sender(&fixture.publisher_user_id)
+            .server_ts(u64::from(MilliSecondsSinceUnixEpoch::now().0));
+        fixture
+            .server
+            .mock_get_members()
+            .ok(vec![f.member(&fixture.subscriber_user_id).into_raw()])
+            .mock_once()
+            .mount()
+            .await;
+        fixture
+            .server
+            .mock_room_event_context()
+            .room(fixture.stream_id.room_id.clone())
+            .match_event_id()
+            .ok(RoomContextResponseTemplate::new(
+                f.text_msg("initial").event_id(&fixture.stream_id.event_id).into_event(),
+            ))
+            .mock_once()
+            .mount()
+            .await;
+
+        fixture
+            .publisher
+            .publishers
+            .handle_subscribe(ToDeviceEvent::new(
+                fixture.subscriber_user_id.clone(),
+                fixture.subscription_content(),
+            ))
+            .await;
+
+        let handle = fixture.publisher.publishers.publisher(&fixture.stream_id).await.unwrap();
+        assert!(
+            handle
+                .state
+                .lock()
+                .await
+                .subscribers
+                .contains_key(&(fixture.subscriber_user_id, fixture.subscriber_device_id))
+        );
+    }
+
+    #[async_test]
+    async fn test_unknown_stream_does_not_query_uncached_subscriber_device() {
+        let fixture = set_up_subscribable_stream_with_uncached_subscriber().await;
+        let content = StreamSubscribeEventContent::new(
+            fixture.stream_id.room_id.clone(),
+            event_id!("$unknown").to_owned(),
+            fixture.subscriber_device_id.clone(),
+        );
+        let key_queries_before = fixture
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().contains("/keys/query"))
+            .count();
+
+        assert_subscription_rejected(
+            &fixture.server,
+            &fixture.publisher.publishers,
+            fixture.subscriber_user_id,
+            content,
+            StreamCancelCode::UnknownStream,
+            "Unknown or expired stream",
+        )
+        .await;
+
+        let key_queries_after = fixture
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().contains("/keys/query"))
+            .count();
+        assert_eq!(key_queries_after, key_queries_before);
+    }
+
+    #[async_test]
     async fn test_rejects_subscription_with_empty_device_id() {
         let fixture = set_up_subscribable_stream().await;
         let content = StreamSubscribeEventContent::new(
@@ -1131,9 +1323,17 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_rejects_subscriber_that_is_not_joined_to_the_room() {
-        let fixture = set_up_subscribable_stream().await;
+    async fn test_rejects_uncached_subscriber_that_is_not_joined_without_querying_device() {
+        let fixture = set_up_subscribable_stream_with_uncached_subscriber().await;
         fixture.server.mock_get_members().ok(Vec::new()).mock_once().mount().await;
+        let key_queries_before = fixture
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().contains("/keys/query"))
+            .count();
 
         assert_subscription_rejected(
             &fixture.server,
@@ -1144,6 +1344,16 @@ mod tests {
             "Subscriber is not joined to the room",
         )
         .await;
+
+        let key_queries_after = fixture
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().contains("/keys/query"))
+            .count();
+        assert_eq!(key_queries_after, key_queries_before);
     }
 
     #[async_test]

@@ -16,6 +16,8 @@
 
 use std::fmt;
 
+#[cfg(feature = "experimental-event-streams")]
+use ruma::events::event_stream::StreamDescriptor;
 use ruma::{
     OwnedEventId,
     events::{
@@ -41,6 +43,10 @@ pub struct Message {
     pub(in crate::timeline) msgtype: MessageType,
     pub(in crate::timeline) edited: bool,
     pub(in crate::timeline) mentions: Option<Mentions>,
+    #[cfg(feature = "experimental-event-streams")]
+    pub(in crate::timeline) stream: Option<StreamDescriptor>,
+    #[cfg(feature = "experimental-event-streams")]
+    pub(in crate::timeline) transient_body: Option<String>,
 }
 
 impl Message {
@@ -48,12 +54,21 @@ impl Message {
     pub(in crate::timeline) fn from_event(
         mut msgtype: MessageType,
         mentions: Option<Mentions>,
+        #[cfg(feature = "experimental-event-streams")] stream: Option<StreamDescriptor>,
         edit: Option<RoomMessageEventContentWithoutRelation>,
         remove_reply_fallback: RemoveReplyFallback,
     ) -> Self {
         msgtype.sanitize(DEFAULT_SANITIZER_MODE, remove_reply_fallback);
 
-        let mut ret = Self { msgtype, edited: false, mentions };
+        let mut ret = Self {
+            msgtype,
+            edited: false,
+            mentions,
+            #[cfg(feature = "experimental-event-streams")]
+            stream,
+            #[cfg(feature = "experimental-event-streams")]
+            transient_body: None,
+        };
 
         if let Some(edit) = edit {
             ret.apply_edit(edit);
@@ -70,6 +85,11 @@ impl Message {
         self.msgtype = new_content.msgtype;
         self.mentions = new_content.mentions;
         self.edited = true;
+        #[cfg(feature = "experimental-event-streams")]
+        {
+            self.stream = None;
+            self.transient_body = None;
+        }
     }
 
     /// Get the `msgtype`-specific data of this message.
@@ -93,6 +113,26 @@ impl Message {
     /// Get the mentions of this message.
     pub fn mentions(&self) -> Option<&Mentions> {
         self.mentions.as_ref()
+    }
+
+    /// Get the event stream descriptor advertised by this message, if any.
+    #[cfg(feature = "experimental-event-streams")]
+    pub fn stream(&self) -> Option<&StreamDescriptor> {
+        self.stream.as_ref()
+    }
+
+    /// Get the current transient body received for this message's event stream.
+    ///
+    /// Transient bodies are only populated while a UI event-stream subscription
+    /// is active and are not part of the room history.
+    #[cfg(feature = "experimental-event-streams")]
+    pub fn transient_body(&self) -> Option<&str> {
+        self.transient_body.as_deref()
+    }
+
+    #[cfg(feature = "experimental-event-streams")]
+    pub(in crate::timeline) fn set_transient_body(&mut self, body: Option<String>) {
+        self.transient_body = body;
     }
 }
 
@@ -170,7 +210,15 @@ pub(crate) fn extract_poll_edit_content(
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { msgtype: _, edited, mentions: _ } = self;
+        let Self {
+            msgtype: _,
+            edited,
+            mentions: _,
+            #[cfg(feature = "experimental-event-streams")]
+                stream: _,
+            #[cfg(feature = "experimental-event-streams")]
+                transient_body: _,
+        } = self;
         // since timeline items are logged, don't include all fields here so
         // people don't leak personal data in bug reports
         f.debug_struct("Message").field("edited", edited).finish_non_exhaustive()
