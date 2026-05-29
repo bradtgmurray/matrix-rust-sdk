@@ -305,7 +305,7 @@ impl TimelineItemContent {
         msgtype: MessageType,
         mentions: Option<Mentions>,
         #[cfg(feature = "experimental-event-streams")] stream: Option<
-            ruma::events::event_stream::StreamDescriptor,
+            ruma::events::stream::StreamDescriptor,
         >,
         reactions: ReactionsByKeyBySender,
         thread_root: Option<OwnedEventId>,

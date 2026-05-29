@@ -5,11 +5,17 @@ use ruma::{
     MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedUserId, assign,
     events::{
         ToDeviceEvent,
-        event_stream::{
-            StreamCancelCode, StreamCancelEventContent, StreamDescriptor,
-            StreamSubscribeEventContent, StreamUpdateEventContent, StreamUpdateOperation,
-        },
         room::message::{OriginalSyncRoomMessageEvent, Relation},
+        stream::{
+            StreamDescriptor,
+            cancel::{
+                StreamCancelCode, ToDeviceStreamCancelEventContent as StreamCancelEventContent,
+            },
+            subscribe::ToDeviceStreamSubscribeEventContent as StreamSubscribeEventContent,
+            update::{
+                StreamUpdateOperation, ToDeviceStreamUpdateEventContent as StreamUpdateEventContent,
+            },
+        },
     },
 };
 use tokio::sync::{Mutex, broadcast};
@@ -155,7 +161,8 @@ impl EventStreamSubscriptions {
 
         let stream_id = StreamId::new(room_id.clone(), event_id.clone());
         let expires_at_ms = descriptor.expiry_ms.map(|expiry_ms| {
-            u64::from(descriptor_origin_server_ts.0).saturating_add(u64::from(expiry_ms))
+            let expiry_ms = u64::try_from(expiry_ms.as_millis()).unwrap_or(u64::MAX);
+            u64::from(descriptor_origin_server_ts.0).saturating_add(expiry_ms)
         });
         let expiry_token = expires_at_ms.map(|_| CancellationToken::new());
 
@@ -363,7 +370,7 @@ impl EventStreamSubscriptions {
             }
 
             let mut should_resync = false;
-            let update = match content.op {
+            let update = match content.operation {
                 StreamUpdateOperation::Replace(new_content) => {
                     trace!(
                         room_id = %stream_id.room_id,
@@ -578,8 +585,11 @@ mod tests {
         MilliSecondsSinceUnixEpoch, event_id,
         events::{
             StaticEventContent, ToDeviceEvent,
-            event_stream::{StreamUpdateContent, StreamUpdateEventContent, StreamUpdateOperation},
             room::message::{OriginalSyncRoomMessageEvent, RoomMessageEventContentWithoutRelation},
+            stream::update::{
+                StreamUpdateContent, StreamUpdateOperation,
+                ToDeviceStreamUpdateEventContent as StreamUpdateEventContent,
+            },
         },
         owned_device_id, owned_user_id, room_id,
     };
@@ -952,7 +962,7 @@ mod tests {
         let fixture = SubscribableEventFixture::with_mock_server().await;
         let mut updates = fixture.subscriptions.subscribe_to_updates();
         let mut descriptor = fixture.descriptor();
-        descriptor.expiry_ms = Some(uint!(0));
+        descriptor.expiry_ms = Some(Duration::ZERO);
 
         let _subscribe = fixture
             .server()

@@ -17,7 +17,7 @@
 use std::fmt;
 
 #[cfg(feature = "experimental-event-streams")]
-use ruma::events::event_stream::StreamDescriptor;
+use ruma::events::stream::StreamDescriptor;
 use ruma::{
     OwnedEventId,
     events::{

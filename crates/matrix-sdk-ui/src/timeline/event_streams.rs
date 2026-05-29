@@ -118,7 +118,8 @@ impl EventStreamSubscriptionInner {
                 let message = event.content().as_message()?;
                 let descriptor = message.stream()?;
                 if descriptor.expiry_ms.is_some_and(|expiry_ms| {
-                    u64::from(event.timestamp().0).saturating_add(u64::from(expiry_ms))
+                    u64::from(event.timestamp().0)
+                        .saturating_add(u64::try_from(expiry_ms.as_millis()).unwrap_or(u64::MAX))
                         <= u64::from(MilliSecondsSinceUnixEpoch::now().0)
                 }) {
                     return None;
